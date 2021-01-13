@@ -12,10 +12,11 @@
 #include <std_msgs/Float32.h>
 #include <nav_msgs/Path.h>
 #include <nav_msgs/Odometry.h>
-#include <geometry_msgs/PointStamped.h>
+#include <geometry_msgs/Point32.h>
 #include <geometry_msgs/PolygonStamped.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <sensor_msgs/PointCloud.h>
 #include <sensor_msgs/Joy.h>
 
 #include <tf/transform_datatypes.h>
@@ -114,6 +115,7 @@ std::vector<int> correspondences[gridVoxelNum];
 
 bool newLaserCloud = false;
 bool newTerrainCloud = false;
+bool newMapCloud = false;
 
 double odomTime = 0;
 double joyTime = 0;
@@ -122,6 +124,8 @@ float vehicleRoll = 0, vehiclePitch = 0, vehicleYaw = 0;
 float vehicleX = 0, vehicleY = 0, vehicleZ = 0;
 
 pcl::VoxelGrid<pcl::PointXYZI> laserDwzFilter, terrainDwzFilter;
+
+sensor_msgs::PointCloud mapObstacles;
 
 void odometryHandler(const nav_msgs::Odometry::ConstPtr& odom)
 {
@@ -137,6 +141,8 @@ void odometryHandler(const nav_msgs::Odometry::ConstPtr& odom)
   vehicleX = odom->pose.pose.position.x - cos(yaw) * sensorOffsetX + sin(yaw) * sensorOffsetY;
   vehicleY = odom->pose.pose.position.y - sin(yaw) * sensorOffsetX - cos(yaw) * sensorOffsetY;
   vehicleZ = odom->pose.pose.position.z;
+
+  // cout << "POS : " << vehicleX << " " << vehicleY << " " << vehicleYaw << endl;
 }
 
 void laserCloudHandler(const sensor_msgs::PointCloud2ConstPtr& laserCloud2)
@@ -233,10 +239,10 @@ void joystickHandler(const sensor_msgs::Joy::ConstPtr& joy)
   }
 }
 
-void goalHandler(const geometry_msgs::PointStamped::ConstPtr& goal)
+void goalHandler(const sensor_msgs::PointCloud::ConstPtr& goal)
 {
-  goalX = goal->point.x;
-  goalY = goal->point.y;
+  goalX = goal->points.front().y;
+  goalY = -goal->points.front().x;
 }
 
 void speedHandler(const std_msgs::Float32::ConstPtr& speed)
@@ -308,6 +314,20 @@ void checkObstacleHandler(const std_msgs::Bool::ConstPtr& checkObs)
   if (autonomyMode && checkObsTime - joyTime > joyToCheckObstacleDelay) {
     checkObstacle = checkObs->data;
   }
+}
+
+void mapObsHandler(const sensor_msgs::PointCloud::ConstPtr& mapObs)
+{
+  mapObstacles.points.clear();
+  mapObstacles.header = mapObs->header;
+  for(int i = 0; i < mapObs->points.size(); i++) {
+    geometry_msgs::Point32 temp_point;
+    temp_point.x = mapObs->points[i].y;
+    temp_point.y = -mapObs->points[i].x;
+    temp_point.z = mapObs->points[i].z;
+    mapObstacles.points.push_back(temp_point);
+  }
+  newMapCloud = true;
 }
 
 int readPlyHeader(FILE *filePtr)
@@ -535,7 +555,7 @@ int main(int argc, char** argv)
   nhPrivate.getParam("goalY", goalY);
 
   ros::Subscriber subOdometry = nh.subscribe<nav_msgs::Odometry>
-                                ("/state_estimation", 5, odometryHandler);
+                                ("/odom_truth", 5, odometryHandler);
 
   ros::Subscriber subLaserCloud = nh.subscribe<sensor_msgs::PointCloud2>
                                   ("/registered_scan", 5, laserCloudHandler);
@@ -545,7 +565,7 @@ int main(int argc, char** argv)
 
   ros::Subscriber subJoystick = nh.subscribe<sensor_msgs::Joy> ("/joy", 5, joystickHandler);
 
-  ros::Subscriber subGoal = nh.subscribe<geometry_msgs::PointStamped> ("/way_point", 5, goalHandler);
+  ros::Subscriber subGoal = nh.subscribe<sensor_msgs::PointCloud> ("global_goal", 5, goalHandler);
 
   ros::Subscriber subSpeed = nh.subscribe<std_msgs::Float32> ("/speed", 5, speedHandler);
 
@@ -554,6 +574,8 @@ int main(int argc, char** argv)
   ros::Subscriber subAddedObstacles = nh.subscribe<sensor_msgs::PointCloud2> ("/added_obstacles", 5, addedObstaclesHandler);
 
   ros::Subscriber subCheckObstacle = nh.subscribe<std_msgs::Bool> ("/check_obstacle", 5, checkObstacleHandler);
+
+  ros::Subscriber map_obs_sub = nh.subscribe<sensor_msgs::PointCloud> ("/map_obs_points1", 5, mapObsHandler);
 
   ros::Publisher pubPath = nh.advertise<nav_msgs::Path> ("/path", 5);
   nav_msgs::Path path;
@@ -602,30 +624,13 @@ int main(int argc, char** argv)
 
   ros::Rate rate(100);
   bool status = ros::ok();
+  int k = 0;
   while (status) {
     ros::spinOnce();
 
-    if (newLaserCloud || newTerrainCloud) {
-      if (newLaserCloud) {
-        newLaserCloud = false;
-
-        laserCloudStack[laserCloudCount]->clear();
-        *laserCloudStack[laserCloudCount] = *laserCloudDwz;
-        laserCloudCount = (laserCloudCount + 1) % laserCloudStackNum;
-
-        plannerCloud->clear();
-        for (int i = 0; i < laserCloudStackNum; i++) {
-          *plannerCloud += *laserCloudStack[i];
-        }
-      }
-
-      if (newTerrainCloud) {
-        newTerrainCloud = false;
-
-        plannerCloud->clear();
-        *plannerCloud = *terrainCloudDwz;
-      }
-
+    //选取laser点云或者terrain点云
+    if (newMapCloud) {
+      newMapCloud = false;
       float sinVehicleRoll = sin(vehicleRoll);
       float cosVehicleRoll = cos(vehicleRoll);
       float sinVehiclePitch = sin(vehiclePitch);
@@ -635,53 +640,25 @@ int main(int argc, char** argv)
 
       pcl::PointXYZI point;
       plannerCloudCrop->clear();
-      int plannerCloudSize = plannerCloud->points.size();
-      for (int i = 0; i < plannerCloudSize; i++) {
-        float pointX1 = plannerCloud->points[i].x - vehicleX;
-        float pointY1 = plannerCloud->points[i].y - vehicleY;
-        float pointZ1 = plannerCloud->points[i].z - vehicleZ;
+      
+      int mapObstacleSize = mapObstacles.points.size();
+      for (int i = 0; i < mapObstacleSize; i++) {
+        float pointX1 = mapObstacles.points[i].x - vehicleX;
+        float pointY1 = mapObstacles.points[i].y - vehicleY;
+        float pointZ1 = mapObstacles.points[i].z - vehicleZ;
 
         point.x = pointX1 * cosVehicleYaw + pointY1 * sinVehicleYaw;
         point.y = -pointX1 * sinVehicleYaw + pointY1 * cosVehicleYaw;
         point.z = pointZ1;
-        point.intensity = plannerCloud->points[i].intensity;
-
-        float dis = sqrt(point.x * point.x + point.y * point.y);
-        if (dis < adjacentRange && ((point.z > minRelZ && point.z < maxRelZ) || useTerrainAnalysis)) {
-          plannerCloudCrop->push_back(point);
-        }
-      }
-
-      int boundaryCloudSize = boundaryCloud->points.size();
-      for (int i = 0; i < boundaryCloudSize; i++) {
-        point.x = ((boundaryCloud->points[i].x - vehicleX) * cosVehicleYaw 
-                + (boundaryCloud->points[i].y - vehicleY) * sinVehicleYaw) / pathScale;
-        point.y = (-(boundaryCloud->points[i].x - vehicleX) * sinVehicleYaw 
-                + (boundaryCloud->points[i].y - vehicleY) * cosVehicleYaw) / pathScale;
-        point.z = boundaryCloud->points[i].z;
-        point.intensity = boundaryCloud->points[i].intensity;
 
         float dis = sqrt(point.x * point.x + point.y * point.y);
         if (dis < adjacentRange) {
+          cout << "OBS : " << point.x << " " << point.y << endl;
           plannerCloudCrop->push_back(point);
         }
       }
 
-      int addedObstaclesSize = addedObstacles->points.size();
-      for (int i = 0; i < addedObstaclesSize; i++) {
-        point.x = ((addedObstacles->points[i].x - vehicleX) * cosVehicleYaw 
-                + (addedObstacles->points[i].y - vehicleY) * sinVehicleYaw) / pathScale;
-        point.y = (-(addedObstacles->points[i].x - vehicleX) * sinVehicleYaw 
-                + (addedObstacles->points[i].y - vehicleY) * cosVehicleYaw) / pathScale;
-        point.z = addedObstacles->points[i].z;
-        point.intensity = addedObstacles->points[i].intensity;
-
-        float dis = sqrt(point.x * point.x + point.y * point.y);
-        if (dis < adjacentRange) {
-          plannerCloudCrop->push_back(point);
-        }
-      }
-
+      // path范围随joyspeed变化,最大4.25,最小1
       float pathRange = adjacentRange;
       if (pathRangeBySpeed) pathRange = adjacentRange * joySpeed;
       if (pathRange < minPathRange) pathRange = minPathRange;
@@ -691,10 +668,10 @@ int main(int argc, char** argv)
         float relativeGoalX = ((goalX - vehicleX) * cosVehicleYaw + (goalY - vehicleY) * sinVehicleYaw);
         float relativeGoalY = (-(goalX - vehicleX) * sinVehicleYaw + (goalY - vehicleY) * cosVehicleYaw);
 
-        relativeGoalDis = sqrt(relativeGoalX * relativeGoalX + relativeGoalY * relativeGoalY);
-        joyDir = atan2(relativeGoalY, relativeGoalX) * 180 / PI;
+        relativeGoalDis = sqrt(relativeGoalX * relativeGoalX + relativeGoalY * relativeGoalY); // goal相对vehicle距离
+        joyDir = atan2(relativeGoalY, relativeGoalX) * 180 / PI; //goal相对vehicle角度
       }
-
+      // pathScale 初值为1.25, 最小值0.75
       bool pathFound = false;
       float defPathScale = pathScale;
       if (pathScaleBySpeed) pathScale = defPathScale * joySpeed;
@@ -714,9 +691,14 @@ int main(int argc, char** argv)
         float diameter = sqrt(vehicleLength / 2.0 * vehicleLength / 2.0 + vehicleWidth / 2.0 * vehicleWidth / 2.0);
         float angOffset = atan2(vehicleWidth, vehicleLength) * 180.0 / PI;
         int plannerCloudCropSize = plannerCloudCrop->points.size();
+        // cout << "plannerCloudCropSize : " << plannerCloudCropSize << endl;
+        // 遍历障碍物点云
         for (int i = 0; i < plannerCloudCropSize; i++) {
-          float x = plannerCloudCrop->points[i].x / pathScale;
-          float y = plannerCloudCrop->points[i].y / pathScale;
+          //点云内部点局部坐标
+          float x = 2;
+          float y = 1;
+          // float x = plannerCloudCrop->points[i].x / pathScale;
+          // float y = plannerCloudCrop->points[i].y / pathScale;
           float h = plannerCloudCrop->points[i].intensity;
           float dis = sqrt(x * x + y * y);
 
@@ -731,7 +713,7 @@ int main(int argc, char** argv)
                   ((10.0 * rotDir > dirThre && 360.0 - 10.0 * rotDir > dirThre) && fabs(joyDir) > 90.0 && dirToVehicle)) {
                 continue;
               }
-
+              //映射转换
               float x2 = cos(rotAng) * x + sin(rotAng) * y;
               float y2 = -sin(rotAng) * x + cos(rotAng) * y;
 
@@ -772,6 +754,7 @@ int main(int argc, char** argv)
         if (minObsAngCW > 0) minObsAngCW = 0;
         if (minObsAngCCW < 0) minObsAngCCW = 0;
 
+        //选择最优的path
         for (int i = 0; i < 36 * pathNum; i++) {
           int rotDir = int(i / pathNum);
           float angDiff = fabs(joyDir - (10.0 * rotDir - 180.0));
@@ -843,9 +826,10 @@ int main(int argc, char** argv)
           }
 
           path.header.stamp = ros::Time().fromSec(odomTime);
-          path.header.frame_id = "/vehicle";
+          path.header.frame_id = "/base_link";
           pubPath.publish(path);
 
+          //显示freePath
           #if PLOTPATHSET == 1
           freePaths->clear();
           for (int i = 0; i < 36 * pathNum; i++) {
@@ -866,6 +850,7 @@ int main(int argc, char** argv)
 
             if (clearPathList[i] < pointPerPathThre) {
               int freePathLength = paths[i % pathNum]->points.size();
+              // cout << "i : " << i << "    freePathLength : " << freePathLength << endl;
               for (int j = 0; j < freePathLength; j++) {
                 point = paths[i % pathNum]->points[j];
 
@@ -885,11 +870,14 @@ int main(int argc, char** argv)
               }
             }
           }
+          // cout << "freePaths.size : " << freePaths->size() << endl;
+          // cout << "pathRange : " << pathRange << endl;
+          // cout << "pathScale : " << pathScale << endl;
 
           sensor_msgs::PointCloud2 freePaths2;
           pcl::toROSMsg(*freePaths, freePaths2);
           freePaths2.header.stamp = ros::Time().fromSec(odomTime);
-          freePaths2.header.frame_id = "/vehicle";
+          freePaths2.header.frame_id = "/base_link";
           pubFreePaths.publish(freePaths2);
           #endif
         }
@@ -915,7 +903,7 @@ int main(int argc, char** argv)
         path.poses[0].pose.position.z = 0;
 
         path.header.stamp = ros::Time().fromSec(odomTime);
-        path.header.frame_id = "/vehicle";
+        path.header.frame_id = "/base_link";
         pubPath.publish(path);
 
         #if PLOTPATHSET == 1
@@ -923,7 +911,7 @@ int main(int argc, char** argv)
         sensor_msgs::PointCloud2 freePaths2;
         pcl::toROSMsg(*freePaths, freePaths2);
         freePaths2.header.stamp = ros::Time().fromSec(odomTime);
-        freePaths2.header.frame_id = "/vehicle";
+        freePaths2.header.frame_id = "/base_link";
         pubFreePaths.publish(freePaths2);
         #endif
       }
@@ -931,7 +919,7 @@ int main(int argc, char** argv)
       /*sensor_msgs::PointCloud2 plannerCloud2;
       pcl::toROSMsg(*plannerCloudCrop, plannerCloud2);
       plannerCloud2.header.stamp = ros::Time().fromSec(odomTime);
-      plannerCloud2.header.frame_id = "/vehicle";
+      plannerCloud2.header.frame_id = "/base_link";
       pubLaserCloud.publish(plannerCloud2);*/
     }
 
